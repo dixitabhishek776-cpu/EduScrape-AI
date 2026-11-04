@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,9 +11,11 @@ import streamlit as st
 
 from core.registry import ConnectorRegistry
 from connectors.demo_connector import DemoCSVConnector
+from connectors.aktu_pdf_connector import AKTUPDFConnector
 from analytics.engine import AcademicAnalytics
 from exports.workbook import build_workbook
 from core.schemas import REQUIRED_COLUMNS, OPTIONAL_COLUMNS
+from batch_processing import read_roster, collect_pdf_files, process_pdf_batch, build_batch_workbook
 
 st.set_page_config(page_title="EduScrape AI", page_icon="🎓", layout="wide")
 
@@ -34,6 +37,7 @@ div[data-testid="stMetric"] {border: 1px solid rgba(128,93,224,.22); padding: 12
 def registry():
     r = ConnectorRegistry()
     r.register(DemoCSVConnector())
+    r.register(AKTUPDFConnector())
     return r
 
 def make_demo_data():
@@ -92,7 +96,7 @@ st.markdown("""
 
 with st.sidebar:
     st.header("⚙️ Workspace")
-    page = st.radio("Navigate", ["Overview", "Student Explorer", "Batch Analytics", "Subject Intelligence", "AI Insights", "Data & Connectors", "Export Center"])
+    page = st.radio("Navigate", ["Overview", "Institution Batch Studio", "Student Explorer", "Batch Analytics", "Subject Intelligence", "AI Insights", "Data & Connectors", "Export Center"])
     st.divider()
     st.caption("Prototype mode · Privacy-first")
     st.info("Use only records you are authorized to process. This prototype does not bypass CAPTCHA, logins, rate limits or access controls.")
@@ -101,6 +105,12 @@ if "records" not in st.session_state:
     st.session_state.records = make_demo_data()
 if "dataset_label" not in st.session_state:
     st.session_state.dataset_label = "Built-in demonstration dataset"
+if "institution_roster" not in st.session_state:
+    st.session_state.institution_roster = None
+if "batch_manifest" not in st.session_state:
+    st.session_state.batch_manifest = None
+if "batch_raw_texts" not in st.session_state:
+    st.session_state.batch_raw_texts = {}
 
 df = st.session_state.records.copy()
 analytics = AcademicAnalytics(df)
@@ -127,11 +137,87 @@ if page == "Overview":
     st.subheader("Recent records")
     st.dataframe(df.head(12), use_container_width=True, hide_index=True)
 
+elif page == "Institution Batch Studio":
+    st.subheader("🏫 Institution Batch Studio")
+    st.caption("Create a branch-level collection job from an authorized student roster and result documents.")
+    st.warning("This workflow processes documents supplied by your institution. It does not sign in to university portals, bypass CAPTCHA, or retrieve records that the portal has not made available to you.")
+
+    st.markdown("#### 1 · Institution batch details")
+    a, b, c = st.columns(3)
+    institution_name = a.text_input("Institution", value="", placeholder="College / institution name")
+    academic_batch = b.text_input("Admission batch", placeholder="e.g. 2023")
+    examination = c.text_input("Examination / semester", placeholder="e.g. Semester 5")
+    branch_filter = st.text_input("Branch", placeholder="e.g. CSE AI")
+
+    st.markdown("#### 2 · Upload student roster")
+    roster_upload = st.file_uploader("Roster CSV / XLSX (must include roll_number or student_id)", type=["csv", "xlsx"], key="institution_roster_upload")
+    if roster_upload is not None:
+        try:
+            roster = read_roster(roster_upload)
+            if branch_filter:
+                roster["branch"] = roster["branch"].replace("", branch_filter).fillna(branch_filter)
+            if institution_name:
+                roster["institution"] = institution_name
+            if academic_batch:
+                roster["admission_year"] = academic_batch
+            st.session_state.institution_roster = roster
+            st.success(f"Roster validated: {len(roster):,} unique student roll numbers.")
+            st.dataframe(roster.drop(columns=["_roll_key"], errors="ignore").head(25), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Roster validation failed: {e}")
+
+    roster = st.session_state.institution_roster
+    if roster is not None:
+        st.markdown("#### 3 · Upload result documents")
+        st.caption("Upload multiple PDFs or one/more ZIP files containing PDFs. Each PDF is matched against the roster by roll number.")
+        docs = st.file_uploader("Result PDFs / ZIP archives", type=["pdf", "zip"], accept_multiple_files=True, key="institution_result_docs")
+        if st.button("Process batch documents", type="primary", disabled=not docs):
+            try:
+                pdf_files = collect_pdf_files(docs)
+                if not pdf_files:
+                    st.error("No PDF documents found in the selected uploads.")
+                else:
+                    with st.spinner(f"Extracting and matching {len(pdf_files):,} PDF document(s)…"):
+                        manifest, raw_texts = process_pdf_batch(pdf_files, roster)
+                    st.session_state.batch_manifest = manifest
+                    st.session_state.batch_raw_texts = raw_texts
+                    st.success(f"Processed {len(manifest):,} document(s). Review statuses before using any result data.")
+            except Exception as e:
+                st.error(f"Batch processing failed: {e}")
+
+    manifest = st.session_state.batch_manifest
+    if manifest is not None and not manifest.empty:
+        st.markdown("#### 4 · Batch processing results")
+        matched = int(manifest["matching_status"].eq("MATCHED").sum())
+        duplicate = int(manifest["matching_status"].eq("DUPLICATE_RESULT_DOCUMENT").sum())
+        unmatched = int((~manifest["matching_status"].isin(["MATCHED", "DUPLICATE_RESULT_DOCUMENT"])).sum())
+        x, y, z = st.columns(3)
+        x.metric("Roster students", len(roster))
+        y.metric("Unique matched documents", matched)
+        z.metric("Needs attention", unmatched + duplicate)
+        st.dataframe(manifest, use_container_width=True, hide_index=True)
+        st.info("Important: SGPA/CGPA values are labelled candidates only. Subject-wise marks remain pending until the institution's exact marksheet layout is validated. No official result is marked verified automatically.")
+        unmatched_rows = manifest[~manifest["matching_status"].eq("MATCHED")]
+        if not unmatched_rows.empty:
+            with st.expander("Review unmatched / duplicate documents"):
+                st.dataframe(unmatched_rows, use_container_width=True, hide_index=True)
+        selected_file = st.selectbox("Preview extracted text", list(st.session_state.batch_raw_texts.keys()))
+        preview = st.session_state.batch_raw_texts.get(selected_file, "")
+        st.text_area("Extracted PDF text (read-only review)", preview, height=260)
+        workbook = build_batch_workbook(roster, manifest, st.session_state.batch_raw_texts)
+        safe_branch = re.sub(r"[^A-Za-z0-9_-]+", "_", branch_filter or "Branch")
+        safe_batch = re.sub(r"[^A-Za-z0-9_-]+", "_", academic_batch or "Batch")
+        st.download_button("⬇️ Download institution batch workbook", workbook,
+            file_name=f"EduScrape_{safe_branch}_{safe_batch}_Batch_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 elif page == "Student Explorer":
     st.subheader("🔎 Student Explorer")
     ids = sorted(df["student_id"].dropna().astype(str).unique().tolist())
-    selected = st.selectbox("Select student roll number / student ID", ids)
-    student = df[df.student_id.astype(str) == str(selected)]
+    selected = st.text_input("Search student roll number / student ID", placeholder="Enter complete roll number")
+    if not selected and ids:
+        selected = ids[0]
+    student = df[df.student_id.astype(str).str.strip().str.casefold() == str(selected).strip().casefold()] if selected else df.iloc[0:0]
     if not student.empty:
         first = student.iloc[0]
         a,b,c,d = st.columns(4)
@@ -149,9 +235,20 @@ elif page == "Student Explorer":
 
 elif page == "Batch Analytics":
     st.subheader("📊 Batch & cohort analytics")
+    f1, f2, f3 = st.columns(3)
     branches = ["All"] + sorted(df.branch.dropna().astype(str).unique().tolist())
-    chosen = st.selectbox("Branch filter", branches)
-    filtered = df if chosen == "All" else df[df.branch.astype(str) == chosen]
+    chosen = f1.selectbox("Branch filter", branches)
+    years = ["All"] + sorted(df.admission_year.dropna().astype(str).unique().tolist())
+    chosen_year = f2.selectbox("Admission batch", years)
+    periods = ["All"] + sorted(df.examination_period.dropna().astype(str).unique().tolist())
+    chosen_period = f3.selectbox("Examination period", periods)
+    filtered = df.copy()
+    if chosen != "All":
+        filtered = filtered[filtered.branch.astype(str) == chosen]
+    if chosen_year != "All":
+        filtered = filtered[filtered.admission_year.astype(str) == chosen_year]
+    if chosen_period != "All":
+        filtered = filtered[filtered.examination_period.astype(str) == chosen_period]
     cohort = AcademicAnalytics(filtered)
     s = cohort.summary()
     c1,c2,c3,c4 = st.columns(4)
